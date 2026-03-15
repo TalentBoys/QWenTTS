@@ -1,5 +1,5 @@
 """
-Qwen3-TTS Streaming Server (Apple Silicon / MLX)
+Qwen3-TTS Streaming Server (GPU / CUDA)
 
 OpenAI-compatible /v1/audio/speech endpoint with:
   - Streaming audio output (PCM float32 chunks)
@@ -7,7 +7,7 @@ OpenAI-compatible /v1/audio/speech endpoint with:
   - Voice cloning via ref_audio / ref_text
 
 Usage:
-  python server.py [--host 0.0.0.0] [--port 8000] [--model mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16]
+  python server_gpu.py [--host 0.0.0.0] [--port 8000] [--model Qwen/Qwen3-TTS-12Hz-1.7B-Base] [--secret TOKEN]
 """
 
 import argparse
@@ -16,6 +16,7 @@ import base64
 import io
 import json
 import logging
+import platform
 import struct
 import tempfile
 import time
@@ -25,10 +26,11 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 logging.basicConfig(level=logging.INFO)
@@ -40,20 +42,71 @@ logger = logging.getLogger(__name__)
 MODEL = None
 MODEL_PATH: str = ""
 SAMPLE_RATE = 24000
+SECRET: Optional[str] = None
 
-# Cache for pre-loaded reference audio (mx.array) keyed by name
-# Each entry: {"audio": mx.array, "text": str}
-# Note: we only pass ref_audio (without ref_text) to generate() so the model
-# uses the fast speaker-embedding path instead of the slow ICL path.
-_ref_audio_cache: dict = {}  # name -> {"audio": mx.array, "text": str}
+# Cache for pre-loaded reference audio (VoiceClonePromptItem) keyed by name
+# Each entry: {"prompt": VoiceClonePromptItem, "text": str}
+_ref_audio_cache: dict = {}
+
+
+def detect_environment():
+    """Detect current runtime environment and return info dict."""
+    info = {"os": platform.system(), "mode": "unknown"}
+
+    if platform.system() == "Darwin":
+        info["mode"] = "macOS (Apple Silicon) — MLX mode"
+    elif platform.system() == "Linux":
+        try:
+            with open("/proc/version") as f:
+                if "microsoft" in f.read().lower():
+                    info["mode"] = "WSL2 (Linux on Windows) — CUDA GPU mode"
+                else:
+                    info["mode"] = "Linux — CUDA GPU mode"
+        except Exception:
+            info["mode"] = "Linux — CUDA GPU mode"
+
+    if torch.cuda.is_available():
+        info["gpu"] = torch.cuda.get_device_name(0)
+        info["vram"] = f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f}GB"
+    else:
+        info["gpu"] = "N/A (CPU mode)"
+        info["vram"] = "N/A"
+
+    return info
+
+
+def print_environment(info: dict, model_path: str):
+    """Print environment info banner."""
+    print(f"\n[Environment] Running on: {info['mode']}")
+    print(f"  GPU: {info.get('gpu', 'N/A')}")
+    print(f"  VRAM: {info.get('vram', 'N/A')}")
+    print(f"  Model: {model_path}")
+    print()
 
 
 def load_tts_model(model_path: str):
-    """Load the MLX Qwen3-TTS model."""
+    """Load the Qwen3-TTS model on GPU."""
     global MODEL, MODEL_PATH
-    from mlx_audio.tts.utils import load_model
+    from qwen_tts import Qwen3TTSModel
+
     logger.info(f"Loading model: {model_path} ...")
-    MODEL = load_model(model_path)
+
+    load_kwargs = {
+        "device_map": "cuda:0" if torch.cuda.is_available() else "cpu",
+        "dtype": torch.bfloat16,
+    }
+
+    # Use flash_attention_2 if available, otherwise fall back to sdpa
+    if torch.cuda.is_available():
+        try:
+            import flash_attn  # noqa: F401
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("Using flash_attention_2")
+        except ImportError:
+            load_kwargs["attn_implementation"] = "sdpa"
+            logger.info("flash-attn not installed, using sdpa (PyTorch native) attention")
+
+    MODEL = Qwen3TTSModel.from_pretrained(model_path, **load_kwargs)
     MODEL_PATH = model_path
     logger.info("Model loaded successfully.")
 
@@ -86,10 +139,25 @@ async def save_upload_to_tempfile(upload: UploadFile) -> str:
     return tmp.name
 
 
+def run_generate_voice_clone(text: str, language: str, **kwargs):
+    """
+    Run model.generate_voice_clone() and return (audio_np, sample_rate).
+    Handles the list output format: wavs is List[np.ndarray].
+    """
+    wavs, sr = MODEL.generate_voice_clone(
+        text=text,
+        language=language,
+        **kwargs,
+    )
+    # wavs is a list (even for single input); take the first element
+    audio_np = wavs[0] if isinstance(wavs, list) else wavs
+    return audio_np.astype(np.float32), sr
+
+
 # ---------------------------------------------------------------------------
 # FastAPI App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Qwen3-TTS Streaming Server", version="1.0.0")
+app = FastAPI(title="Qwen3-TTS Streaming Server (GPU)", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,6 +165,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Require Bearer token or ?token= query param when SECRET is set."""
+    if SECRET is None:
+        return await call_next(request)
+
+    # Allow GET / (UI page) without auth
+    if request.method == "GET" and request.url.path == "/":
+        return await call_next(request)
+
+    # Check Authorization header
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] == SECRET:
+        return await call_next(request)
+
+    # Check ?token= query param
+    if request.query_params.get("token") == SECRET:
+        return await call_next(request)
+
+    return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+
+# ---------------------------------------------------------------------------
+# GET / — Serve the Web UI
+# ---------------------------------------------------------------------------
+@app.get("/")
+async def serve_ui():
+    ui_path = Path(__file__).parent / "ui.html"
+    return FileResponse(ui_path, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +209,7 @@ async def audio_speech(request: Request):
     JSON body:
       - input (str): text to synthesise
       - model (str, optional): ignored (uses loaded model)
-      - voice (str, optional): speaker name for CustomVoice, default "Chelsie"
+      - voice (str, optional): cached speaker name, default "default"
       - language (str, optional): default "Chinese"
       - response_format (str): "wav" | "pcm"  (default "wav")
       - stream (bool): if true, stream raw PCM float32 chunks
@@ -124,7 +223,7 @@ async def audio_speech(request: Request):
     if not text:
         raise HTTPException(400, "Missing 'input' field.")
 
-    voice = body.get("voice", "Chelsie")
+    voice = body.get("voice", "default")
     language = body.get("language", "Chinese")
     response_format = body.get("response_format", "wav")
     stream = body.get("stream", False)
@@ -132,43 +231,45 @@ async def audio_speech(request: Request):
     ref_text = body.get("ref_text", None)
     speed = body.get("speed", 1.0)
 
-    import mlx.core as mx
+    # Build generation kwargs
+    gen_kwargs = {}
 
-    # Resolve cached speaker if applicable
-    # Only pass ref_audio (no ref_text) to force speaker-embedding path instead of ICL
     if voice in _ref_audio_cache and not ref_audio:
+        # Use cached voice clone prompt
         cached = _ref_audio_cache[voice]
-        ref_audio = cached["audio"]
-        ref_text = None  # no ref_text → speaker embedding path (fast)
-        logger.info(f"Using cached speaker '{voice}' via speaker-embedding path")
+        gen_kwargs["voice_clone_prompt"] = cached["prompt"]
+        logger.info(f"Using cached speaker '{voice}' via voice_clone_prompt")
+    elif ref_audio is not None:
+        # Pre-compute prompt from ref_audio (base64/URL) — use ICL mode for best clone quality
+        prompt_items = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: MODEL.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text if ref_text else None,
+                x_vector_only_mode=not bool(ref_text),
+            ),
+        )
+        gen_kwargs["voice_clone_prompt"] = prompt_items
+    else:
+        raise HTTPException(
+            400,
+            "Base model requires reference audio. Either provide 'ref_audio' + 'ref_text' in the request, "
+            "or register a speaker first via POST /v1/speakers then use voice=<name>.",
+        )
 
     # ----- Streaming PCM output -----
     if stream:
         async def generate_stream():
             try:
-                gen_kwargs = dict(
-                    text=text,
-                    language=language,
-                    verbose=False,
+                audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: run_generate_voice_clone(text, language, **gen_kwargs),
                 )
-
-                if ref_audio is not None:
-                    gen_kwargs["ref_audio"] = ref_audio
-                    if ref_text:
-                        gen_kwargs["ref_text"] = ref_text
-                else:
-                    gen_kwargs["voice"] = voice
-
-                results = MODEL.generate(**gen_kwargs)
-
-                for result in results:
-                    audio = result.audio
-                    if hasattr(audio, "tolist"):
-                        audio_np = np.array(audio, dtype=np.float32)
-                    else:
-                        audio_np = np.array(audio, dtype=np.float32)
-                    yield audio_np.tobytes()
-
+                # Stream the audio in chunks
+                chunk_size = 4096 * 4  # bytes (float32 samples)
+                audio_bytes = audio_np.tobytes()
+                for i in range(0, len(audio_bytes), chunk_size):
+                    yield audio_bytes[i : i + chunk_size]
             except Exception as e:
                 logger.error(f"Streaming generation error: {e}", exc_info=True)
 
@@ -183,38 +284,14 @@ async def audio_speech(request: Request):
 
     # ----- Non-streaming: generate full audio then return -----
     try:
-        gen_kwargs = dict(
-            text=text,
-            language=language,
-            verbose=False,
+        audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: run_generate_voice_clone(text, language, **gen_kwargs),
         )
-
-        if ref_audio is not None:
-            gen_kwargs["ref_audio"] = ref_audio
-            if ref_text:
-                gen_kwargs["ref_text"] = ref_text
-        else:
-            gen_kwargs["voice"] = voice
-
-        results = list(MODEL.generate(**gen_kwargs))
-        # Collect all audio chunks
-        all_audio = []
-        for result in results:
-            audio = result.audio
-            if hasattr(audio, "tolist"):
-                audio_np = np.array(audio, dtype=np.float32)
-            else:
-                audio_np = np.array(audio, dtype=np.float32)
-            all_audio.append(audio_np)
-
-        if not all_audio:
-            raise HTTPException(500, "No audio generated.")
-
-        full_audio = np.concatenate(all_audio) if len(all_audio) > 1 else all_audio[0]
 
         if response_format == "pcm":
             return Response(
-                content=full_audio.astype(np.float32).tobytes(),
+                content=audio_np.tobytes(),
                 media_type="application/octet-stream",
                 headers={
                     "X-Sample-Rate": str(SAMPLE_RATE),
@@ -223,7 +300,7 @@ async def audio_speech(request: Request):
             )
 
         # Default: WAV
-        wav_bytes = numpy_to_wav_bytes(full_audio, SAMPLE_RATE)
+        wav_bytes = numpy_to_wav_bytes(audio_np, sr)
         return Response(content=wav_bytes, media_type="audio/wav")
 
     except Exception as e:
@@ -247,25 +324,17 @@ async def stream_text_speech(request: Request):
     streaming PCM float32 chunks back as they become available.
 
     Query params or JSON body:
-      - voice (str): speaker name, default "Chelsie"
+      - voice (str): speaker name, default "default"
       - language (str): default "Chinese"
       - ref_audio (str, optional): reference audio URL/base64
       - ref_text (str, optional): reference text
     """
-    # Try to read initial config from query params
-    voice = request.query_params.get("voice", "Chelsie")
+    voice = request.query_params.get("voice", "default")
     language = request.query_params.get("language", "Chinese")
     ref_audio = request.query_params.get("ref_audio", None)
     ref_text = request.query_params.get("ref_text", None)
 
-    import mlx.core as mx
-
     async def generate_from_streaming_text():
-        """
-        Read text chunks from the request body and generate audio incrementally.
-        Strategy: accumulate text, when we see sentence-ending punctuation or 'done',
-        synthesize that segment and stream back audio.
-        """
         buffer = ""
         sentence_enders = {"。", "！", "？", ".", "!", "?", "\n", "；", ";", "，", ",", "：", ":", "—"}
         received_any = False
@@ -276,28 +345,23 @@ async def stream_text_speech(request: Request):
                 logger.info(f"stream-text received chunk ({len(chunk)} bytes): {text_data[:100]!r}")
                 received_any = True
 
-                # Support both newline-delimited JSON and plain text
                 for line in text_data.split("\n"):
                     line = line.strip()
                     if not line:
                         continue
 
-                    # Try JSON format
                     try:
                         obj = json.loads(line)
                         text_piece = obj.get("text", "")
                         done = obj.get("done", False)
                     except (json.JSONDecodeError, TypeError):
-                        # Plain text mode
                         text_piece = line
                         done = False
 
                     buffer += text_piece
 
-                    # Check if we have a complete sentence to synthesize
                     segments_to_synth = []
                     while buffer:
-                        # Find the earliest sentence ender
                         earliest_pos = -1
                         for ender in sentence_enders:
                             pos = buffer.find(ender)
@@ -305,7 +369,6 @@ async def stream_text_speech(request: Request):
                                 earliest_pos = pos
 
                         if earliest_pos != -1:
-                            # Extract sentence up to and including the ender
                             segment = buffer[: earliest_pos + 1].strip()
                             buffer = buffer[earliest_pos + 1 :]
                             if segment:
@@ -313,7 +376,6 @@ async def stream_text_speech(request: Request):
                         else:
                             break
 
-                    # Synthesize each complete sentence
                     for segment in segments_to_synth:
                         logger.info(f"Synthesizing segment: '{segment[:60]}'")
                         async for audio_bytes in _synthesize_segment(
@@ -321,7 +383,6 @@ async def stream_text_speech(request: Request):
                         ):
                             yield audio_bytes
 
-                    # Force-flush if buffer is long but has no punctuation
                     if len(buffer.strip()) > 30:
                         flush_text = buffer.strip()
                         buffer = ""
@@ -331,7 +392,6 @@ async def stream_text_speech(request: Request):
                         ):
                             yield audio_bytes
 
-                    # If done, flush remaining buffer
                     if done and buffer.strip():
                         async for audio_bytes in _synthesize_segment(
                             buffer.strip(), voice, language, ref_audio, ref_text
@@ -345,7 +405,6 @@ async def stream_text_speech(request: Request):
         if not received_any:
             logger.warning("stream-text: request body was empty — no chunks received")
 
-        # Flush any remaining text
         if buffer.strip():
             async for audio_bytes in _synthesize_segment(
                 buffer.strip(), voice, language, ref_audio, ref_text
@@ -365,31 +424,32 @@ async def stream_text_speech(request: Request):
 async def _synthesize_segment(text, voice, language, ref_audio, ref_text):
     """Synthesize a text segment and yield PCM audio bytes."""
     try:
-        gen_kwargs = dict(
-            text=text,
-            language=language,
-            verbose=False,
-        )
+        gen_kwargs = {}
 
-        # Check if voice matches a cached clone speaker
-        # Only pass ref_audio (no ref_text) → speaker-embedding path (fast)
         if voice in _ref_audio_cache and not ref_audio:
             cached = _ref_audio_cache[voice]
-            gen_kwargs["ref_audio"] = cached["audio"]
-            # no ref_text → forces speaker embedding instead of ICL
-            logger.info(f"Using cached speaker '{voice}' via speaker-embedding path")
+            gen_kwargs["voice_clone_prompt"] = cached["prompt"]
+            logger.info(f"Using cached speaker '{voice}' via voice_clone_prompt")
         elif ref_audio:
-            gen_kwargs["ref_audio"] = ref_audio
-            if ref_text:
-                gen_kwargs["ref_text"] = ref_text
+            # Pre-compute prompt from raw ref_audio — use ICL mode for best clone quality
+            prompt_items = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: MODEL.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text if ref_text else None,
+                    x_vector_only_mode=not bool(ref_text),
+                ),
+            )
+            gen_kwargs["voice_clone_prompt"] = prompt_items
         else:
-            gen_kwargs["voice"] = voice
+            logger.error("No ref_audio or cached speaker available for segment synthesis")
+            return
 
-        results = MODEL.generate(**gen_kwargs)
-        for result in results:
-            audio = result.audio
-            audio_np = np.array(audio, dtype=np.float32)
-            yield audio_np.tobytes()
+        audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+        )
+        yield audio_np.tobytes()
 
     except Exception as e:
         logger.error(f"Segment synthesis error for '{text[:50]}...': {e}", exc_info=True)
@@ -410,6 +470,9 @@ async def clone_voice_speech(
     """
     Voice clone endpoint that accepts audio file upload.
 
+    Pre-computes voice_clone_prompt (embedding + codes) once, then generates
+    using the cached prompt — same path as registered speakers.
+
     Form data:
       - text: text to synthesize
       - language: "Chinese", "English", etc.
@@ -421,28 +484,39 @@ async def clone_voice_speech(
     ref_path = await save_upload_to_tempfile(ref_audio)
     is_stream = stream.lower() == "true"
 
-    import mlx.core as mx
+    # Pre-compute voice clone prompt — use ICL mode for best clone quality
+    try:
+        prompt_items = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: MODEL.create_voice_clone_prompt(
+                ref_audio=ref_path,
+                ref_text=ref_text,
+            ),
+        )
+    except Exception as e:
+        Path(ref_path).unlink(missing_ok=True)
+        logger.error(f"Clone prompt creation error: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
 
-    gen_kwargs = dict(
-        text=text,
-        language=language,
-        ref_audio=ref_path,
-        ref_text=ref_text,
-        verbose=False,
-    )
+    Path(ref_path).unlink(missing_ok=True)
+
+    gen_kwargs = {
+        "voice_clone_prompt": prompt_items,
+    }
 
     if is_stream:
         async def stream_clone():
             try:
-                results = MODEL.generate(**gen_kwargs)
-                for result in results:
-                    audio = result.audio
-                    audio_np = np.array(audio, dtype=np.float32)
-                    yield audio_np.tobytes()
+                audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+                )
+                chunk_size = 4096 * 4
+                audio_bytes = audio_np.tobytes()
+                for i in range(0, len(audio_bytes), chunk_size):
+                    yield audio_bytes[i : i + chunk_size]
             except Exception as e:
                 logger.error(f"Clone streaming error: {e}", exc_info=True)
-            finally:
-                Path(ref_path).unlink(missing_ok=True)
 
         return StreamingResponse(
             stream_clone(),
@@ -454,29 +528,22 @@ async def clone_voice_speech(
         )
 
     try:
-        results = list(MODEL.generate(**gen_kwargs))
-        all_audio = []
-        for result in results:
-            audio = result.audio
-            audio_np = np.array(audio, dtype=np.float32)
-            all_audio.append(audio_np)
-
-        full_audio = np.concatenate(all_audio) if len(all_audio) > 1 else all_audio[0]
-
-        Path(ref_path).unlink(missing_ok=True)
+        audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+        )
 
         if response_format == "pcm":
             return Response(
-                content=full_audio.astype(np.float32).tobytes(),
+                content=audio_np.tobytes(),
                 media_type="application/octet-stream",
                 headers={"X-Sample-Rate": str(SAMPLE_RATE)},
             )
 
-        wav_bytes = numpy_to_wav_bytes(full_audio, SAMPLE_RATE)
+        wav_bytes = numpy_to_wav_bytes(audio_np, sr)
         return Response(content=wav_bytes, media_type="audio/wav")
 
     except Exception as e:
-        Path(ref_path).unlink(missing_ok=True)
         logger.error(f"Clone generation error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
 
@@ -510,30 +577,23 @@ async def register_speaker(
 ):
     """
     Pre-load reference audio so subsequent TTS calls using this speaker name
-    skip the file-read + resample overhead.
+    skip the feature extraction overhead.
 
     After registration, use voice=<name> (without ref_audio/ref_text) and
-    the cached mx.array will be used automatically.
+    the cached voice_clone_prompt will be used automatically.
     """
-    from mlx_audio.utils import load_audio as _load_audio
-    import mlx.core as mx
-
     ref_path = await save_upload_to_tempfile(ref_audio)
     try:
-        audio_mx = _load_audio(ref_path, sample_rate=SAMPLE_RATE)
-        mx.eval(audio_mx)
-        _ref_audio_cache[name] = {"audio": audio_mx, "text": ref_text}
-        # Verify speaker embedding can be extracted (warm up the encoder)
-        if hasattr(MODEL, "extract_speaker_embedding"):
-            try:
-                emb = MODEL.extract_speaker_embedding(audio_mx)
-                mx.eval(emb)
-                logger.info(f"Registered speaker '{name}' — audio shape {audio_mx.shape}, embedding shape {emb.shape}")
-            except Exception as emb_err:
-                logger.warning(f"Speaker embedding extraction failed for '{name}': {emb_err}")
-                logger.info(f"Registered speaker '{name}' — audio shape {audio_mx.shape} (will use ICL fallback)")
-        else:
-            logger.info(f"Registered speaker '{name}' — audio shape {audio_mx.shape}")
+        # Build reusable voice clone prompt — use ICL mode for best clone quality
+        prompt_items = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: MODEL.create_voice_clone_prompt(
+                ref_audio=ref_path,
+                ref_text=ref_text,
+            ),
+        )
+        _ref_audio_cache[name] = {"prompt": prompt_items, "text": ref_text}
+        logger.info(f"Registered speaker '{name}' via create_voice_clone_prompt")
         return {"ok": True, "name": name, "cached_speakers": list(_ref_audio_cache.keys())}
     except Exception as e:
         logger.error(f"Failed to register speaker '{name}': {e}", exc_info=True)
@@ -545,10 +605,9 @@ async def register_speaker(
 
 @app.get("/v1/speakers")
 async def list_speakers():
-    """List built-in + cached speakers."""
-    builtin = MODEL.get_supported_speakers() if MODEL else []
+    """List cached speakers."""
     cached = list(_ref_audio_cache.keys())
-    return {"builtin": builtin, "cached": cached}
+    return {"builtin": [], "cached": cached}
 
 
 # ---------------------------------------------------------------------------
@@ -562,44 +621,39 @@ async def health():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def detect_environment():
-    """Detect current runtime environment and return info dict."""
-    import platform
-    info = {"os": platform.system(), "mode": "unknown"}
-
-    if platform.system() == "Darwin":
-        info["mode"] = "macOS (Apple Silicon) — MLX mode"
-    elif platform.system() == "Linux":
-        try:
-            with open("/proc/version") as f:
-                if "microsoft" in f.read().lower():
-                    info["mode"] = "WSL2 (Linux on Windows)"
-                else:
-                    info["mode"] = "Linux"
-        except Exception:
-            info["mode"] = "Linux"
-
-    return info
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Qwen3-TTS Streaming Server")
+    parser = argparse.ArgumentParser(description="Qwen3-TTS Streaming Server (GPU)")
     parser.add_argument(
         "--model",
         type=str,
-        default="mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
+        default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         help="HuggingFace model ID or local path",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--secret",
+        type=str,
+        default=None,
+        help="Bearer token for API authentication (optional, no auth if omitted)",
+    )
     args = parser.parse_args()
+
+    # Set global secret for auth middleware
+    global SECRET
+    SECRET = args.secret
 
     # Environment detection
     env_info = detect_environment()
-    print(f"\n[Environment] Running on: {env_info['mode']}")
-    print(f"  Model: {args.model}\n")
+    print_environment(env_info, args.model)
 
     load_tts_model(args.model)
+
+    if SECRET:
+        print(f"\n[Auth] Secret token enabled. Use:")
+        print(f"  Authorization: Bearer {SECRET}")
+        print(f"  or ?token={SECRET}")
+        print()
 
     logger.info(f"Starting server on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
