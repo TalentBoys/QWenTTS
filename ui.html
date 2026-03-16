@@ -310,6 +310,14 @@ async function testConnection() {
   status.innerHTML = '<span class="spinner"></span>';
   try {
     const resp = await apiFetch('/health');
+    if (resp.status === 401) {
+      status.innerHTML = `<span style="color:var(--danger)">401 Unauthorized — check Token</span>`;
+      log('Server reachable but token is missing or incorrect.', 'err');
+      return;
+    }
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
     const data = await resp.json();
     status.innerHTML = `<span style="color:var(--success)">Connected: ${data.model}</span>`;
     log(`Server connected: ${data.model}`, 'ok');
