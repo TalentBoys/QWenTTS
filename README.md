@@ -8,6 +8,13 @@
 
 两个版本的 API 接口完全一致，`test_client.py` 无需修改即可同时适配。
 
+## 支持平台
+
+| 版本 | 平台 | 要求 |
+|------|------|------|
+| `server.py` | macOS (Apple Silicon) | M1/M2/M3/M4 芯片 |
+| `server_gpu.py` | Linux / WSL2 / 云服务器 | NVIDIA GPU + CUDA（推荐 VRAM >= 16GB） |
+
 ## 功能
 
 - **语音合成** — `/v1/audio/speech`，支持流式/非流式音频输出
