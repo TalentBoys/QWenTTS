@@ -48,6 +48,64 @@ SECRET: Optional[str] = None
 # Each entry: {"prompt": VoiceClonePromptItem, "text": str}
 _ref_audio_cache: dict = {}
 
+# Directory for persistent speaker storage
+SPEAKERS_DIR = Path(__file__).parent / "speakers"
+
+# Inference lock — only one generate() at a time to prevent GPU contention
+_inference_lock: Optional[asyncio.Semaphore] = None
+
+
+def _get_inference_lock() -> asyncio.Semaphore:
+    global _inference_lock
+    if _inference_lock is None:
+        _inference_lock = asyncio.Semaphore(1)
+    return _inference_lock
+
+
+def _save_speaker(name: str, prompt_items, ref_text: str):
+    """Persist a speaker's voice clone prompt to disk."""
+    SPEAKERS_DIR.mkdir(exist_ok=True)
+    data = []
+    for item in prompt_items:
+        data.append({
+            "ref_code": item.ref_code.cpu() if item.ref_code is not None else None,
+            "ref_spk_embedding": item.ref_spk_embedding.cpu(),
+            "x_vector_only_mode": item.x_vector_only_mode,
+            "icl_mode": item.icl_mode,
+            "ref_text": item.ref_text,
+        })
+    torch.save({"items": data, "ref_text": ref_text}, SPEAKERS_DIR / f"{name}.pt")
+    logger.info(f"Speaker '{name}' saved to {SPEAKERS_DIR / f'{name}.pt'}")
+
+
+def _load_speakers():
+    """Load all persisted speakers into _ref_audio_cache."""
+    if not SPEAKERS_DIR.exists():
+        return
+    from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+
+    device = MODEL.device
+    count = 0
+    for pt_file in sorted(SPEAKERS_DIR.glob("*.pt")):
+        name = pt_file.stem
+        try:
+            saved = torch.load(pt_file, map_location="cpu", weights_only=False)
+            items = []
+            for d in saved["items"]:
+                items.append(VoiceClonePromptItem(
+                    ref_code=d["ref_code"].to(device) if d["ref_code"] is not None else None,
+                    ref_spk_embedding=d["ref_spk_embedding"].to(device),
+                    x_vector_only_mode=d["x_vector_only_mode"],
+                    icl_mode=d["icl_mode"],
+                    ref_text=d["ref_text"],
+                ))
+            _ref_audio_cache[name] = {"prompt": items, "text": saved["ref_text"]}
+            count += 1
+        except Exception as e:
+            logger.error(f"Failed to load speaker '{name}' from {pt_file}: {e}")
+    if count:
+        logger.info(f"Loaded {count} speaker(s) from disk: {list(_ref_audio_cache.keys())}")
+
 
 def detect_environment():
     """Detect current runtime environment and return info dict."""
@@ -90,6 +148,7 @@ def load_tts_model(model_path: str):
     from qwen_tts import Qwen3TTSModel
 
     logger.info(f"Loading model: {model_path} ...")
+    t_load = time.perf_counter()
 
     load_kwargs = {
         "device_map": "cuda:0" if torch.cuda.is_available() else "cpu",
@@ -108,7 +167,10 @@ def load_tts_model(model_path: str):
 
     MODEL = Qwen3TTSModel.from_pretrained(model_path, **load_kwargs)
     MODEL_PATH = model_path
-    logger.info("Model loaded successfully.")
+    logger.info(f"[TIMING] Model loaded in {time.perf_counter()-t_load:.1f}s")
+    logger.info(f"  Device: {MODEL.device}")
+    logger.info(f"  Model dtype: {next(MODEL.model.parameters()).dtype}")
+    _load_speakers()
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +206,22 @@ def run_generate_voice_clone(text: str, language: str, **kwargs):
     Run model.generate_voice_clone() and return (audio_np, sample_rate).
     Handles the list output format: wavs is List[np.ndarray].
     """
+    t0 = time.perf_counter()
     wavs, sr = MODEL.generate_voice_clone(
         text=text,
         language=language,
         **kwargs,
     )
+    t1 = time.perf_counter()
     # wavs is a list (even for single input); take the first element
     audio_np = wavs[0] if isinstance(wavs, list) else wavs
+    duration_audio = len(audio_np) / sr
+    logger.info(
+        f"[TIMING] generate_voice_clone: {t1-t0:.2f}s | "
+        f"audio={duration_audio:.1f}s ({len(audio_np)} samples) | "
+        f"RTF={t1-t0:.2f}/{duration_audio:.1f}={(t1-t0)/max(duration_audio,0.01):.2f}x | "
+        f"text='{text[:50]}'"
+    )
     return audio_np.astype(np.float32), sr
 
 
@@ -233,14 +304,16 @@ async def audio_speech(request: Request):
 
     # Build generation kwargs
     gen_kwargs = {}
+    t_start = time.perf_counter()
 
     if voice in _ref_audio_cache and not ref_audio:
         # Use cached voice clone prompt
         cached = _ref_audio_cache[voice]
         gen_kwargs["voice_clone_prompt"] = cached["prompt"]
-        logger.info(f"Using cached speaker '{voice}' via voice_clone_prompt")
+        logger.info(f"[TIMING] Using cached speaker '{voice}' (prompt lookup: {time.perf_counter()-t_start:.3f}s)")
     elif ref_audio is not None:
         # Pre-compute prompt from ref_audio (base64/URL) — use ICL mode for best clone quality
+        t_prompt = time.perf_counter()
         prompt_items = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: MODEL.create_voice_clone_prompt(
@@ -249,6 +322,7 @@ async def audio_speech(request: Request):
                 x_vector_only_mode=not bool(ref_text),
             ),
         )
+        logger.info(f"[TIMING] create_voice_clone_prompt: {time.perf_counter()-t_prompt:.2f}s")
         gen_kwargs["voice_clone_prompt"] = prompt_items
     else:
         raise HTTPException(
@@ -261,10 +335,11 @@ async def audio_speech(request: Request):
     if stream:
         async def generate_stream():
             try:
-                audio_np, sr = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: run_generate_voice_clone(text, language, **gen_kwargs),
-                )
+                async with _get_inference_lock():
+                    audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+                    )
                 # Stream the audio in chunks
                 chunk_size = 4096 * 4  # bytes (float32 samples)
                 audio_bytes = audio_np.tobytes()
@@ -284,10 +359,14 @@ async def audio_speech(request: Request):
 
     # ----- Non-streaming: generate full audio then return -----
     try:
-        audio_np, sr = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: run_generate_voice_clone(text, language, **gen_kwargs),
-        )
+        t_gen = time.perf_counter()
+        async with _get_inference_lock():
+            audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+            )
+        t_total = time.perf_counter() - t_start
+        logger.info(f"[TIMING] /v1/audio/speech total: {t_total:.2f}s (text='{text[:50]}')")
 
         if response_format == "pcm":
             return Response(
@@ -423,15 +502,17 @@ async def stream_text_speech(request: Request):
 
 async def _synthesize_segment(text, voice, language, ref_audio, ref_text):
     """Synthesize a text segment and yield PCM audio bytes."""
+    t_seg = time.perf_counter()
     try:
         gen_kwargs = {}
 
         if voice in _ref_audio_cache and not ref_audio:
             cached = _ref_audio_cache[voice]
             gen_kwargs["voice_clone_prompt"] = cached["prompt"]
-            logger.info(f"Using cached speaker '{voice}' via voice_clone_prompt")
+            logger.info(f"[TIMING] segment: using cached speaker '{voice}'")
         elif ref_audio:
             # Pre-compute prompt from raw ref_audio — use ICL mode for best clone quality
+            t_prompt = time.perf_counter()
             prompt_items = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: MODEL.create_voice_clone_prompt(
@@ -440,15 +521,18 @@ async def _synthesize_segment(text, voice, language, ref_audio, ref_text):
                     x_vector_only_mode=not bool(ref_text),
                 ),
             )
+            logger.info(f"[TIMING] segment create_voice_clone_prompt: {time.perf_counter()-t_prompt:.2f}s")
             gen_kwargs["voice_clone_prompt"] = prompt_items
         else:
             logger.error("No ref_audio or cached speaker available for segment synthesis")
             return
 
-        audio_np, sr = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: run_generate_voice_clone(text, language, **gen_kwargs),
-        )
+        async with _get_inference_lock():
+            audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+            )
+        logger.info(f"[TIMING] segment total: {time.perf_counter()-t_seg:.2f}s (text='{text[:50]}')")
         yield audio_np.tobytes()
 
     except Exception as e:
@@ -483,9 +567,11 @@ async def clone_voice_speech(
     """
     ref_path = await save_upload_to_tempfile(ref_audio)
     is_stream = stream.lower() == "true"
+    t_clone_start = time.perf_counter()
 
     # Pre-compute voice clone prompt — use ICL mode for best clone quality
     try:
+        t_prompt = time.perf_counter()
         prompt_items = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: MODEL.create_voice_clone_prompt(
@@ -493,6 +579,7 @@ async def clone_voice_speech(
                 ref_text=ref_text,
             ),
         )
+        logger.info(f"[TIMING] /clone create_voice_clone_prompt: {time.perf_counter()-t_prompt:.2f}s")
     except Exception as e:
         Path(ref_path).unlink(missing_ok=True)
         logger.error(f"Clone prompt creation error: {e}", exc_info=True)
@@ -507,10 +594,11 @@ async def clone_voice_speech(
     if is_stream:
         async def stream_clone():
             try:
-                audio_np, sr = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: run_generate_voice_clone(text, language, **gen_kwargs),
-                )
+                async with _get_inference_lock():
+                    audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+                    )
                 chunk_size = 4096 * 4
                 audio_bytes = audio_np.tobytes()
                 for i in range(0, len(audio_bytes), chunk_size):
@@ -528,10 +616,13 @@ async def clone_voice_speech(
         )
 
     try:
-        audio_np, sr = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: run_generate_voice_clone(text, language, **gen_kwargs),
-        )
+        t_gen = time.perf_counter()
+        async with _get_inference_lock():
+            audio_np, sr = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: run_generate_voice_clone(text, language, **gen_kwargs),
+            )
+        logger.info(f"[TIMING] /clone total: {time.perf_counter()-t_clone_start:.2f}s (text='{text[:50]}')")
 
         if response_format == "pcm":
             return Response(
@@ -585,6 +676,7 @@ async def register_speaker(
     ref_path = await save_upload_to_tempfile(ref_audio)
     try:
         # Build reusable voice clone prompt — use ICL mode for best clone quality
+        t_reg = time.perf_counter()
         prompt_items = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: MODEL.create_voice_clone_prompt(
@@ -592,7 +684,9 @@ async def register_speaker(
                 ref_text=ref_text,
             ),
         )
+        logger.info(f"[TIMING] register_speaker create_voice_clone_prompt: {time.perf_counter()-t_reg:.2f}s")
         _ref_audio_cache[name] = {"prompt": prompt_items, "text": ref_text}
+        _save_speaker(name, prompt_items, ref_text)
         logger.info(f"Registered speaker '{name}' via create_voice_clone_prompt")
         return {"ok": True, "name": name, "cached_speakers": list(_ref_audio_cache.keys())}
     except Exception as e:
@@ -608,6 +702,20 @@ async def list_speakers():
     """List cached speakers."""
     cached = list(_ref_audio_cache.keys())
     return {"builtin": [], "cached": cached}
+
+
+@app.delete("/v1/speakers/{name}")
+async def delete_speaker(name: str):
+    """Remove a registered speaker from cache and disk."""
+    removed = name in _ref_audio_cache
+    _ref_audio_cache.pop(name, None)
+    pt_file = SPEAKERS_DIR / f"{name}.pt"
+    if pt_file.exists():
+        pt_file.unlink()
+    if not removed and not pt_file.exists():
+        raise HTTPException(404, f"Speaker '{name}' not found")
+    logger.info(f"Deleted speaker '{name}'")
+    return {"ok": True, "name": name, "cached_speakers": list(_ref_audio_cache.keys())}
 
 
 # ---------------------------------------------------------------------------
